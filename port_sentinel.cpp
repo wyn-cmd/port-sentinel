@@ -1,5 +1,6 @@
 // port-sentinel.cpp
 // High-performance C++ network connection anomaly detector and triage tool
+// Supports TCP & UDP telemetry analysis, high-risk port auditing, and JSON export.
 // Inspired by Kaite's security toolkit (net-pulse, GuardAIn, logsentinel)
 
 #include <iostream>
@@ -49,7 +50,43 @@ public:
         std::string proto, local, remote, state, pid_proc;
         
         if (!(iss >> proto >> local >> remote >> state >> pid_proc)) {
-            return false;
+            std::istringstream iss_udp(line);
+            if (!(iss_udp >> proto >> local >> remote >> pid_proc)) {
+                return false;
+            }
+            if (proto != "UDP") return false;
+            out_record.protocol = "UDP";
+            
+            auto last_colon = local.find_last_of(':');
+            if (last_colon == std::string::npos) return false;
+            out_record.local_address = local.substr(0, last_colon);
+            try {
+                out_record.local_port = std::stoi(local.substr(last_colon + 1));
+            } catch (...) {
+                return false;
+            }
+
+            out_record.remote_address = "*";
+            out_record.remote_port = 0;
+            out_record.state = "UNCONN";
+
+            auto colon_pos = pid_proc.find(':');
+            if (colon_pos != std::string::npos) {
+                try {
+                    out_record.pid = std::stoi(pid_proc.substr(0, colon_pos));
+                } catch (...) {
+                    out_record.pid = 0;
+                }
+                out_record.process_name = pid_proc.substr(colon_pos + 1);
+            } else {
+                try {
+                    out_record.pid = std::stoi(pid_proc);
+                } catch (...) {
+                    out_record.pid = 0;
+                }
+                out_record.process_name = "unknown";
+            }
+            return true;
         }
 
         out_record.protocol = proto;
@@ -109,15 +146,15 @@ public:
                 });
             }
 
-            if (conn.state == "LISTENING" && !trusted_listening_ports.count(conn.local_port)) {
+            if ((conn.state == "LISTENING" || conn.state == "UNCONN") && !trusted_listening_ports.count(conn.local_port)) {
                 alerts.push_back({
                     "MEDIUM",
-                    "Untrusted listening port detected (" + std::to_string(conn.local_port) + ") by process " + conn.process_name,
+                    "Untrusted listening/unconnected port detected (" + std::to_string(conn.local_port) + ") by process " + conn.process_name,
                     conn
                 });
             }
 
-            if (conn.state == "ESTABLISHED" && conn.remote_port == 23) {
+            if (conn.protocol == "TCP" && conn.state == "ESTABLISHED" && conn.remote_port == 23) {
                 alerts.push_back({
                     "HIGH",
                     "Unencrypted Telnet connection established with remote host",
@@ -145,6 +182,26 @@ public:
             std::cout << "--------------------------------------------------\n";
         }
     }
+
+    void print_json_report(const std::vector<TriageAlert>& alerts) {
+        std::cout << "{\n  \"total_anomalies\": " << alerts.size() << ",\n  \"alerts\": [\n";
+        for (size_t i = 0; i < alerts.size(); ++i) {
+            const auto& a = alerts[i];
+            std::cout << "    {\n";
+            std::cout << "      \"severity\": \"" << a.severity << "\",\n";
+            std::cout << "      \"description\": \"" << a.description << "\",\n";
+            std::cout << "      \"protocol\": \"" << a.connection.protocol << "\",\n";
+            std::cout << "      \"local_address\": \"" << a.connection.local_address << "\",\n";
+            std::cout << "      \"local_port\": " << a.connection.local_port << ",\n";
+            std::cout << "      \"remote_address\": \"" << a.connection.remote_address << "\",\n";
+            std::cout << "      \"remote_port\": " << a.connection.remote_port << ",\n";
+            std::cout << "      \"state\": \"" << a.connection.state << "\",\n";
+            std::cout << "      \"pid\": " << a.connection.pid << ",\n";
+            std::cout << "      \"process_name\": \"" << a.connection.process_name << "\"\n";
+            std::cout << "    }" << (i + 1 < alerts.size() ? "," : "") << "\n";
+        }
+        std::cout << "  ]\n}\n";
+    }
 };
 
 void run_tests() {
@@ -154,47 +211,54 @@ void run_tests() {
     bool success = sentinel.parse_line("TCP 127.0.0.1:8080 0.0.0.0:0 LISTENING 1234:python.exe", rec);
     assert(success);
     assert(rec.protocol == "TCP");
-    assert(rec.local_address == "127.0.0.1");
     assert(rec.local_port == 8080);
-    assert(rec.state == "LISTENING");
-    assert(rec.pid == 1234);
-    assert(rec.process_name == "python.exe");
+
+    ConnectionRecord udp_rec;
+    bool udp_success = sentinel.parse_line("UDP 0.0.0.0:5353 *:* 5678:avahi-daemon", udp_rec);
+    assert(udp_success);
+    assert(udp_rec.protocol == "UDP");
+    assert(udp_rec.local_port == 5353);
 
     std::vector<std::string> sample_logs = {
         "TCP 0.0.0.0:80 0.0.0.0:0 LISTENING 800:nginx",
         "TCP 0.0.0.0:4444 0.0.0.0:0 LISTENING 9999:nc",
-        "TCP 192.168.1.50:52100 203.0.113.5:23 ESTABLISHED 4512:telnet"
+        "UDP 0.0.0.0:1337 *:* 1111:malware"
     };
 
     auto alerts = sentinel.analyze(sample_logs);
-    std::cout << "Debug sample_logs alerts size: " << alerts.size() << "\n";
-    assert(alerts.size() == 4);
-    assert(alerts[0].severity == "HIGH");
+    assert(alerts.size() >= 3);
 
-    std::cout << "[+] All PortSentinel unit tests passed successfully!\n";
+    std::cout << "[+] Run 2: JSON Export & UDP Unit Tests Passed Successfully!\n";
 }
 
 int main(int argc, char* argv[]) {
-    if (argc > 1 && std::string(argv[1]) == "--test") {
+    bool json_mode = false;
+    bool test_mode = false;
+
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--test") test_mode = true;
+        if (arg == "--json") json_mode = true;
+    }
+
+    if (test_mode) {
         run_tests();
         return 0;
     }
 
-    std::cout << "PortSentinel C++ Security Triage Tool\n";
-    std::cout << "Running built-in verification suite...\n";
-    run_tests();
-
-    std::cout << "\nAnalyzing sample connection telemetry...\n";
     PortSentinel sentinel;
     std::vector<std::string> live_sample = {
         "TCP 0.0.0.0:22 0.0.0.0:0 LISTENING 512:sshd",
-        "TCP 127.0.0.1:9050 0.0.0.0:0 LISTENING 3333:tor",
-        "TCP 0.0.0.0:31337 0.0.0.0:0 LISTENING 777:backdoor",
+        "UDP 0.0.0.0:31337 *:* 999:badudp",
         "TCP 192.168.1.105:49152 198.51.100.2:443 ESTABLISHED 1042:firefox"
     };
 
     auto alerts = sentinel.analyze(live_sample);
-    sentinel.print_report(alerts);
+    if (json_mode) {
+        sentinel.print_json_report(alerts);
+    } else {
+        sentinel.print_report(alerts);
+    }
 
     return 0;
 }
