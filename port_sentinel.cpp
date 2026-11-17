@@ -43,6 +43,30 @@ public:
         trusted_listening_ports.insert(port);
     }
 
+    // Reads a comma-separated list such as "22,443,8443". Entries that are not
+    // ports in the 1-65535 range are skipped, so a typo never trusts port 0.
+    int add_trusted_ports_from_list(const std::string& list) {
+        int added = 0;
+        std::istringstream iss(list);
+        std::string item;
+        while (std::getline(iss, item, ',')) {
+            try {
+                size_t used = 0;
+                int port = std::stoi(item, &used);
+                if (used != item.size() || port < 1 || port > 65535) continue;
+                trusted_listening_ports.insert(port);
+                ++added;
+            } catch (...) {
+                continue;
+            }
+        }
+        return added;
+    }
+
+    bool is_trusted_port(int port) const {
+        return trusted_listening_ports.count(port) > 0;
+    }
+
     bool parse_line(const std::string& line, ConnectionRecord& out_record) {
         if (line.empty() || line[0] == '#' || line[0] == '-') return false;
         
@@ -229,16 +253,33 @@ void run_tests() {
     assert(alerts.size() >= 3);
 
     std::cout << "[+] Run 2: JSON Export & UDP Unit Tests Passed Successfully!\n";
+
+    {
+        PortSentinel t;
+        assert(t.add_trusted_ports_from_list("2222,8443") == 2);
+        assert(t.is_trusted_port(2222));
+        assert(t.is_trusted_port(8443));
+        assert(!t.is_trusted_port(2223));
+    }
+    {
+        PortSentinel t;
+        assert(t.add_trusted_ports_from_list("0,70000,abc,12x,9000") == 1);
+        assert(!t.is_trusted_port(0));
+        assert(!t.is_trusted_port(70000));
+        assert(t.is_trusted_port(9000));
+    }
 }
 
 int main(int argc, char* argv[]) {
     bool json_mode = false;
     bool test_mode = false;
+    std::string trusted_list;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--test") test_mode = true;
         if (arg == "--json") json_mode = true;
+        if (arg == "--trusted" && i + 1 < argc) trusted_list = argv[++i];
     }
 
     if (test_mode) {
@@ -247,6 +288,9 @@ int main(int argc, char* argv[]) {
     }
 
     PortSentinel sentinel;
+    if (!trusted_list.empty()) {
+        sentinel.add_trusted_ports_from_list(trusted_list);
+    }
     std::vector<std::string> live_sample = {
         "TCP 0.0.0.0:22 0.0.0.0:0 LISTENING 512:sshd",
         "UDP 0.0.0.0:31337 *:* 999:badudp",
